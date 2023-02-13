@@ -8,26 +8,25 @@ struct lattice
     L::Int
     Ns::Int
     U::Float32
-    μ::Float32
     Temp::Float32
     Nt::Int
     Δτ::Float32
     λ::Float32
-    Tmatrix::Matrix{Int}
+    Tmatrix::Matrix{Float32}
     expmΔτT::CUDAUDT{Float32}
 
-    function lattice(L::Int,U::Float32,μ::Float32,Temp::Float32,Nt::Int)
+    function lattice(L::Int,U::Float32,Temp::Float32,Nt::Int)
         Ns = L^3
         Δτ = 1/(Temp*Nt)
         λ = acosh(exp(abs(U)*Δτ/2))
-        Tmatrix = adapt(CuArray,initT(L))
-        expmΔτT = CUDAudt(exp(-Δτ * initT(L)))
-        new(L,Ns,U,μ,Temp,Nt,Δτ,λ,Tmatrix,expmΔτT)
+        Tmatrix = initT(L)
+        expmΔτT = CUDAudt(exp(-Δτ * cu(initT(L))))
+        new(L,Ns,U,Temp,Nt,Δτ,λ,Tmatrix,expmΔτT)
     end
 end
 
 function initT(L::Int)
-    Tmatrix = zeros(Int,L^3,L^3)
+    Tmatrix = zeros(Float32,L^3,L^3)
     index::Int = 1
     for z = 1:L, y = 1:L, x = 1:L
         Tmatrix[index, x == 1 ? index+L-1 : index-1] = -1
@@ -56,8 +55,8 @@ function initMultBudt(l::lattice,AuxField::Matrix{Int})
     MultBup[l.Nt+2] = copy(UDTI)
     MultBdn[l.Nt+2] = copy(UDTI)
     for i = 2:l.Nt+1
-        MultBup[i] = CUDAudtMult(MultBup[i-1],CUDAeTeV(l.expmΔτT,exp.(cu( AuxField[:,i-1])*l.λ .+ (l.μ - l.U/2)*l.Δτ)))
-        MultBdn[i] = CUDAudtMult(MultBdn[i-1],CUDAeTeV(l.expmΔτT,exp.(cu(-AuxField[:,i-1])*l.λ .+ (l.μ - l.U/2)*l.Δτ)))
+        MultBup[i] = CUDArmuleTeV(MultBup[i-1],l.expmΔτT,exp.(cu( AuxField[:,i-1])*l.λ))
+        MultBdn[i] = CUDArmuleTeV(MultBdn[i-1],l.expmΔτT,exp.(cu(-AuxField[:,i-1])*l.λ))
     end
     MultBup, MultBdn
 end
@@ -73,8 +72,8 @@ function flipslice!(slice::Int,l::lattice,AuxField::Matrix{Int},Gup::CuArray{Flo
         P = Rup * Rdn
         if P > 1 || rand() < P
             AuxField[site,slice] *= -1
-            updateg!(site,γup[site]/Rup,Gup)
-            updateg!(site,γdn[site]/Rdn,Gdn)
+            Gup += updateg!(site,γup[site]/Rup,Gup)
+            Gdn += updateg!(site,γdn[site]/Rdn,Gdn)
         end
     end
     nothing
@@ -83,28 +82,23 @@ end
 function updateg!(site::Int,prop::Float32,g::CuArray{Float32})
     gtmp = -g[site,:]
     CUDA.@allowscalar gtmp[site] += 1
-    @views g[:,:] -= - prop * g[:,site] * transpose(gtmp)
-    nothing
+    return prop * g[:,site] * transpose(gtmp)
 end
 
 function updateRight!(slice::Int,l::lattice,AuxField::Matrix{Int},
     MultBup::Vector{CUDAUDT},MultBdn::Vector{CUDAUDT},gup::CuArray{Float32},gdn::CuArray{Float32})
-    MultBup[l.Nt-slice+2] = CUDAudtMult(CUDAeTeV(l.expmΔτT,
-        exp.(cu( AuxField[:,slice])*l.λ .+ (l.μ - l.U/2)*l.Δτ)), MultBup[l.Nt-slice+3])
+    MultBup[l.Nt-slice+2] = CUDAlmuleTeV(l.expmΔτT,exp.(cu( AuxField[:,slice])*l.λ),MultBup[l.Nt-slice+3])
     greens!(MultBup[l.Nt-slice+2],MultBup[l.Nt-slice+1],gup)
-    MultBdn[l.Nt-slice+2] = CUDAudtMult(CUDAeTeV(l.expmΔτT,
-        exp.(cu(-AuxField[:,slice])*l.λ .+ (l.μ - l.U/2)*l.Δτ)), MultBdn[l.Nt-slice+3])
+    MultBdn[l.Nt-slice+2] = CUDAlmuleTeV(l.expmΔτT,exp.(cu(-AuxField[:,slice])*l.λ),MultBdn[l.Nt-slice+3])
     greens!(MultBdn[l.Nt-slice+2],MultBdn[l.Nt-slice+1],gdn)
     nothing
 end
 
 function updateLeft!(slice::Int,l::lattice,AuxField::Matrix{Int},
     MultBup::Vector{CUDAUDT},MultBdn::Vector{CUDAUDT},gup::CuArray{Float32},gdn::CuArray{Float32})
-    MultBup[l.Nt-slice+2] = CUDAudtMult(MultBup[l.Nt-slice+1],
-        CUDAeTeV(l.expmΔτT, exp.(cu( AuxField[:,slice])*l.λ .+ (l.μ - l.U/2)*l.Δτ)))
+    MultBup[l.Nt-slice+2] = CUDArmuleTeV(MultBup[l.Nt-slice+1],l.expmΔτT, exp.(cu( AuxField[:,slice])*l.λ))
     greens!(MultBup[l.Nt-slice+2],MultBup[l.Nt-slice+3],gup)
-    MultBdn[l.Nt-slice+2] = CUDAudtMult(MultBdn[l.Nt-slice+1],
-        CUDAeTeV(l.expmΔτT, exp.(cu(-AuxField[:,slice])*l.λ .+ (l.μ - l.U/2)*l.Δτ)))
+    MultBdn[l.Nt-slice+2] = CUDArmuleTeV(MultBdn[l.Nt-slice+1],l.expmΔτT, exp.(cu(-AuxField[:,slice])*l.λ))
     greens!(MultBdn[l.Nt-slice+2],MultBdn[l.Nt-slice+3],gdn)
     nothing
 end
